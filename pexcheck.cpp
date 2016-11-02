@@ -134,6 +134,105 @@ static std::wstring to_utf16(std::string const & s)
 	return std::wstring(res.data(), len);
 }
 
+struct version_t
+{
+	version_t()
+		: v()
+	{
+	}
+
+	version_t(std::initializer_list<uint16_t> components)
+		: version_t()
+	{
+		assert(components.size() <= 4);
+		std::copy(components.begin(), components.end(), v);
+	}
+
+	version_t(char const * s)
+		: version_t(s, s + strlen(s))
+	{
+	}
+
+	version_t(std::string const & s)
+		: version_t(s.data(), s.data() + s.size())
+	{
+	}
+
+	version_t(char const * first, char const * last)
+		: version_t()
+	{
+		auto cur = first;
+
+		auto extract_component = [&] {
+			if (cur == last || *cur == '.')
+				throw std::runtime_error("not a number");
+
+			uint16_t r = 0;
+			for (; cur != last && *cur != '.'; ++cur)
+			{
+				uint16_t next;
+				if ('0' <= *cur && *cur <= '9')
+					next = r * 10 + (*cur - '0');
+				else
+					throw std::runtime_error("not a number");
+				if (next < r)
+					throw std::runtime_error("numeric overflow");
+				r = next;
+			}
+
+			if (cur != last)
+				++cur;
+
+			return r;
+		};
+
+		v[0] = extract_component();
+		v[1] = extract_component();
+		if (cur != last)
+			v[2] = extract_component();
+		if (cur != last)
+			v[3] = extract_component();
+		if (cur != last)
+			throw std::runtime_error("not a version");
+	}
+
+	uint16_t major() const { return v[0]; }
+	uint16_t minor() const { return v[1]; }
+
+	bool operator<(const version_t & other) const
+	{
+		return std::lexicographical_compare(v, v + 4, other.v, other.v + 4);
+	}
+
+	bool operator>(const version_t & other) const
+	{
+		return other < *this;
+	}
+
+	bool operator<=(const version_t & other) const
+	{
+		return !(other < *this);
+	}
+
+	bool operator>=(const version_t & other) const
+	{
+		return !(*this < other);
+	}
+
+	bool operator==(const version_t & other) const
+	{
+		return std::equal(v, v + 4, other.v);
+	}
+
+	bool operator!=(const version_t & other) const
+	{
+		return !(*this == other);
+	}
+
+private:
+	uint16_t v[4];
+};
+
 struct follow_t
 {
 	std::regex templ;
@@ -143,8 +242,8 @@ struct follow_t
 class type_formatter
 {
 public:
-	explicit type_formatter(std::set<std::string> const & exported_fn_names, std::vector<follow_t> const & follows, std::set<std::string> & follow_matches, int ptr_size)
-		: m_exported_fn_names(exported_fn_names), m_ptr_size(ptr_size), m_follows(follows), m_follow_matches(follow_matches)
+	explicit type_formatter(std::set<std::string> const & exported_fn_names, std::vector<follow_t> const & follows, std::vector<std::string> const & ignored_checks, std::set<std::string> & follow_matches, int ptr_size, version_t pex_version)
+		: m_exported_fn_names(exported_fn_names), m_ptr_size(ptr_size), m_follows(follows), m_ignored_checks(ignored_checks), m_follow_matches(follow_matches), m_pex_version(pex_version)
 	{
 	}
 
@@ -168,12 +267,25 @@ public:
 
 				bool first = true;
 
-				CComPtr<IDiaSymbol> class_parent;
-				if (type->get_classParent(&class_parent) == S_OK)
+				if (m_pex_version < version_t{ 1, 0, 0, 5 })
 				{
-					res.append(format_type(class_parent, simple_unnamed));
-					res.append("*");
-					first = false;
+					CComPtr<IDiaSymbol> class_parent;
+					if (type->get_classParent(&class_parent) == S_OK)
+					{
+						res.append(format_type(class_parent, simple_unnamed));
+						res.append("*");
+						first = false;
+					}
+				}
+				else
+				{
+					CComPtr<IDiaSymbol> objectPointerType;
+					hrchk type->get_objectPointerType(&objectPointerType);
+					if (objectPointerType)
+					{
+						res.append(format_type(objectPointerType, simple_unnamed));
+						first = false;
+					}
 				}
 
 				ULONG celt;
@@ -335,10 +447,13 @@ public:
 			tmp.append("fn ");
 
 		tmp.append(to_utf8(fn_name.m_str));
-		tmp.append(" ");
-		tmp.append(this->format_type(fn_type, /*simple_unnamed=*/false));
+		if (!ignore_symbol(tmp))
+		{
+			tmp.append(" ");
+			tmp.append(this->format_type(fn_type, /*simple_unnamed=*/false));
 
-		this->add_line(tmp);
+			this->add_line(tmp);
+		}
 	}
 
 	std::string get_udt_name(CComPtr<IDiaSymbol> const & sym, bool simple_unnamed)
@@ -491,7 +606,14 @@ public:
 				hrsok child->get_type(&data_type);
 
 				std::ostringstream lss;
-				lss << ofs << ":var:" << this->format_type(data_type, simple_unnamed);
+				lss << ofs << ":var:";
+				if (m_pex_version >= version_t{ 1, 4 })
+				{
+					CComBSTR name;
+					hrsok child->get_name(&name);
+					lss << to_utf8(name) << ":";
+				}
+				lss << this->format_type(data_type, simple_unnamed);
 				data.push_back(std::make_pair(ofs, lss.str()));
 			}
 
@@ -518,8 +640,12 @@ public:
 		m_udts.insert(std::make_pair(type_id, name8));
 
 		std::ostringstream oss;
-		oss << "type " << name8 << this->get_udt_contents(sym, /*simple_unnamed=*/false, name8);
-		this->add_line(oss.str());
+		oss << "type " << name8;
+		if (!ignore_symbol(oss.str()))
+		{
+			oss << this->get_udt_contents(sym, /*simple_unnamed=*/false, name8);
+			this->add_line(oss.str());
+		}
 		return name8;
 	}
 
@@ -540,6 +666,17 @@ public:
 		return res;
 	}
 
+	std::set<std::string> get_added_lines(std::set<std::string> const & templ, bool remove_unks)
+	{
+		std::set<std::string> res;
+		std::set_difference(m_lines.begin(), m_lines.end(), templ.begin(), templ.end(), std::inserter(res, res.begin()));
+
+		if (remove_unks)
+			res.erase(res.lower_bound("unk "), res.lower_bound("unk!"));
+
+		return res;
+	}
+
 	void add_unknowns(std::set<std::string> const & handled_exports)
 	{
 		std::set<std::string> unhandled_exports;
@@ -549,9 +686,15 @@ public:
 	}
 
 private:
+	bool ignore_symbol(std::string const & symbol)
+	{
+		return std::binary_search(m_ignored_checks.begin(), m_ignored_checks.end(), symbol);
+	}
+
 	void add_line(std::string const & line)
 	{
 		m_lines.insert(line);
+
 		for (auto && follow : m_follows)
 		{
 			std::match_results<std::string::const_iterator> mrs;
@@ -566,9 +709,11 @@ private:
 	std::map<DWORD, std::string> m_udts;
 	std::set<std::string> m_lines;
 	std::set<std::string> m_exported_fn_names;
+	std::vector<std::string> m_ignored_checks;
 	std::vector<follow_t> const & m_follows;
 	std::set<std::string> & m_follow_matches;
 	int m_ptr_size;
+	version_t m_pex_version;
 };
 
 class pe_section_table
@@ -677,6 +822,30 @@ std::set<std::string> get_exported_addresses(std::string const & fname, int & pt
 	return exported_names;
 }
 
+static version_t get_module_version(HMODULE mod)
+{
+	HRSRC hRsrc = FindResourceW(mod, MAKEINTRESOURCE(1), RT_VERSION);
+	if (!hRsrc)
+		throw std::runtime_error("no version info");
+
+	HGLOBAL hRsrcMem = LoadResource(mod, hRsrc);
+	void * rsrc = LockResource(hRsrcMem);
+	assert(rsrc);
+
+	VS_FIXEDFILEINFO * ffi;
+
+	UINT len;
+	if (!VerQueryValueW(rsrc, L"\\", (void **)&ffi, &len))
+		throw std::runtime_error("VerQueryValueW failed");
+
+	if (len < sizeof *ffi || ffi->dwSignature != VS_FFI_SIGNATURE)
+		throw std::runtime_error("corrupted version info");
+
+	return version_t{ HIWORD(ffi->dwFileVersionMS), LOWORD(ffi->dwFileVersionMS), HIWORD(ffi->dwFileVersionLS), LOWORD(ffi->dwFileVersionLS) };
+}
+
+version_t const current_version = get_module_version(0);
+
 static void print_help(char const * argv0)
 {
 	size_t l = strlen(argv0);
@@ -686,7 +855,23 @@ static void print_help(char const * argv0)
 	if (argv0[l] == '/' || argv0[l] == '\\')
 		++l;
 
-	std::cout << "Usage: " << argv0 + l << " [--warning] [--do-fail] [--no-dia-fail] [--no-unks] [--diff DIFFFILE] [--diff-unks] [-y SYMPATH] [-c CHECKFILE] [-o OUTPUTFILE] PEFILE" << std::endl;
+	std::cout <<
+		"Creates the description of the public interface of a shared library.\n"
+		"\n"
+		"Usage: " << argv0 + l << " [options] PEFILE\n"
+		"\n"
+		"Options:\n"
+		"\n"
+		"    -o OUTPUTFILE    emit the description to OUTPUTFILE instead of stdout\n"
+		"    -y SYMPATH       use SYMPATH as symbol path\n"
+		"    -c CHECKFILE     use header in CHECKFILE to create the description\n"
+		"                     and output the diff\n"
+		"    --diff FILE      (only with -c) output the diff to FILE\n"
+		"    --pex-version V  change the default pex_version from " << current_version.major() << "." << current_version.minor() << " to V\n"
+		"    --warning        don't fail even if the diff is non-empty\n"
+		"    --do-fail        overrides --warning\n"
+		"    --no-dia-fail    only print a warning if DIA SDK is unavailable and succeed\n"
+		"\n";
 }
 
 int _main(int argc, char *argv[])
@@ -701,12 +886,23 @@ int _main(int argc, char *argv[])
 	bool no_unks = false;
 	bool do_fail = false;
 	bool diff_unks = false;
+	version_t version = current_version;
+
 	for (int i = 1; i < argc; ++i)
 	{
 		if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0)
 		{
 			print_help(argv[0]);
 			return 0;
+		}
+		else if (strcmp(argv[i], "--pex-version") == 0)
+		{
+			if (++i >= argc)
+			{
+				print_help(argv[0]);
+				return 2;
+			}
+			version = argv[i];
 		}
 		else if (strcmp(argv[i], "--warning") == 0)
 		{
@@ -835,6 +1031,10 @@ int _main(int argc, char *argv[])
 			if (line.empty())
 			{
 			}
+			else if (line.substr(0, 13) == "%pex_version ")
+			{
+				version = line.substr(13);
+			}
 			else if (line == "%exported_functions")
 			{
 				add_exports = true;
@@ -893,18 +1093,7 @@ int _main(int argc, char *argv[])
 
 		while (std::getline(fin, line))
 		{
-			bool ignore = false;
-			for (std::string const & ig : ignored_checks)
-			{
-				if (line.size() >= ig.size() && line.substr(0, ig.size()) == ig)
-				{
-					ignore = true;
-					break;
-				}
-			}
-
-			if (!ignore)
-				check_lines.insert(line);
+			check_lines.insert(line);
 		}
 
 		if (fin.bad())
@@ -917,6 +1106,8 @@ int _main(int argc, char *argv[])
 	{
 		config_lines.push_back("%exported_functions");
 	}
+
+	std::sort(ignored_checks.begin(), ignored_checks.end());
 
 	if (check_lines.empty() && outputpath.empty())
 		outputpath = "-";
@@ -963,7 +1154,7 @@ int _main(int argc, char *argv[])
 	}
 
 	std::set<std::string> follow_matches;
-	type_formatter fmt(demangled_exports, follow_exprs, follow_matches, ptr_size);
+	type_formatter fmt(demangled_exports, follow_exprs, ignored_checks, follow_matches, ptr_size, version);
 	std::set<std::string> handled_exports;
 
 	size_t last_follow_matches_size = 0;
@@ -992,6 +1183,16 @@ int _main(int argc, char *argv[])
 						do_add = true;
 						handled_exports.insert(name8);
 					}
+				}
+
+				if (!do_add)
+				{
+					CComBSTR mangled_name;
+					hrchk globalFunction->get_name(&mangled_name);
+
+					std::string name8 = to_utf8(mangled_name);
+					if (exported_names.find(name8) != exported_names.end())
+						do_add = true;
 				}
 			}
 
@@ -1092,7 +1293,8 @@ int _main(int argc, char *argv[])
 		}
 
 		std::set<std::string> removed_lines = fmt.get_removed_lines(check_lines, /*remove_unks=*/!diff_unks);
-		if (!removed_lines.empty())
+		std::set<std::string> added_lines = fmt.get_added_lines(check_lines, /*remove_unks=*/!diff_unks);
+		if (!removed_lines.empty() || !added_lines.empty())
 		{
 			std::cout << (diffpath == "-"? chkpath: diffpath) << "(1): " << (succeed? "warning": "error") << ": cross-module compatibility check failed\n";
 			if (!chkpath.empty() && diffpath != "-")
@@ -1100,6 +1302,9 @@ int _main(int argc, char *argv[])
 
 			for (std::set<std::string>::const_iterator it = removed_lines.begin(); it != removed_lines.end(); ++it)
 				*out << '-' << *it << '\n';
+
+			for (std::set<std::string>::const_iterator it = added_lines.begin(); it != added_lines.end(); ++it)
+				*out << '+' << *it << '\n';
 
 			if (!succeed || do_fail)
 				return 1;
